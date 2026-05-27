@@ -1,0 +1,52 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+html, body, #root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  overflow: hidden;
+}
+
+@layer components {
+  .ssd-badge-1 {
+    @apply bg-accent-purple/20 text-accent-purple;
+  }
+  .ssd-badge-2 {
+    @apply bg-accent-coral/20 text-accent-coral;
+  }
+  .ssd-badge-default {
+    @apply bg-neutral-500/20 text-neutral-400;
+  }
+
+  .progress-track {
+    @apply h-1 w-full bg-neutral-700 rounded-full overflow-hidden;
+  }
+  .progress-fill {
+    @apply h-full bg-accent-blue transition-[width] duration-300;
+  }
+
+  .btn {
+    @apply px-3 py-1.5 rounded text-sm font-medium transition-colors;
+  }
+  .btn-primary {
+    @apply btn bg-accent-blue text-white hover:bg-accent-blue/90;
+  }
+  .btn-ghost {
+    @apply btn text-neutral-300 hover:bg-neutral-800;
+  }
+  .btn-danger {
+    @apply btn text-red-400 hover:bg-red-500/10;
+  }
+}

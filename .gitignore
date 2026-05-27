@@ -1,0 +1,28 @@
+node_modules
+dist
+dist-ssr
+*.local
+
+# Claude Code local state (transcripts, settings, etc.)
+.claude/
+
+# Editor
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Tauri
+src-tauri/target
+src-tauri/gen/schemas
+# Note: Cargo.lock IS committed for binary crates (reproducible builds)
+
+# Env
+.env
+.env.*
+!.env.example
