@@ -1,6 +1,7 @@
 use super::GameMetadata;
 use once_cell::sync::Lazy;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 static APP_LIST_CACHE: Lazy<Mutex<Option<Vec<SteamApp>>>> = Lazy::new(|| Mutex::new(None));
@@ -128,4 +129,117 @@ fn normalize(s: &str) -> String {
         .chars()
         .filter(|c| c.is_alphanumeric())
         .collect()
+}
+
+// ---- Vault update detection ----
+
+/// Check which AppIDs have a pending Steam update by scanning the
+/// `appmanifest_*.acf` files across all Steam libraries the user has
+/// (including the vault, which Steam knows about via libraryfolders.vdf).
+///
+/// Steam writes pending-update state directly into the appmanifest's
+/// `StateFlags` field — the same data its own UI uses to render "Update
+/// queued / Unscheduled update / Validating" labels. A value of 4 means
+/// "Fully Installed". Anything else means something is pending:
+///   - 2 = Uninstalled
+///   - 8 = Update Required
+///   - 16 = Files Missing
+///   - 32 = Update Running
+///   - 64 = Files Corrupt
+///   - 1024+ = Update Queued / Unscheduled
+///   - (Steam combines flags bitwise, so values like 1026 are common)
+///
+/// Library paths passed in should point to each Steam library's
+/// `steamapps/common` folder; the manifests live in the parent
+/// `steamapps/`.
+#[tauri::command]
+pub async fn check_vault_updates(
+    library_paths: Vec<String>,
+    app_ids: Vec<String>,
+) -> Result<Vec<String>, String> {
+    use std::collections::HashSet;
+    let mut outdated: HashSet<String> = HashSet::new();
+
+    let steamapps_dirs: Vec<PathBuf> = library_paths
+        .iter()
+        .filter_map(|p| PathBuf::from(p).parent().map(|x| x.to_path_buf()))
+        .collect();
+
+    for app_id in &app_ids {
+        for dir in &steamapps_dirs {
+            let manifest = dir.join(format!("appmanifest_{}.acf", app_id));
+            if !manifest.exists() {
+                continue;
+            }
+            let content = match std::fs::read_to_string(&manifest) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            if let Some(parsed) = super::catalog::parse_appmanifest(&content) {
+                let fully_installed = parsed
+                    .state_flags
+                    .as_deref()
+                    .map(|s| s == "4")
+                    .unwrap_or(false);
+                if !fully_installed {
+                    outdated.insert(app_id.clone());
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(outdated.into_iter().collect())
+}
+
+// ---- Polling Steam's progress on a local appmanifest ----
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalManifestState {
+    pub app_id: String,
+    pub build_id: Option<String>,
+    pub state_flags: Option<String>,
+    /// Convenience flag derived from state_flags: true when Steam reports
+    /// "Fully Installed" (StateFlags = 4). Used by the auto-update
+    /// workflow to know when Steam has finished its patch.
+    pub fully_installed: bool,
+}
+
+/// Read the local Steam library's appmanifest for the given AppID.
+/// Returns `None` if the manifest is missing (game not installed in
+/// that library). Used by the auto-update workflow to poll while Steam
+/// patches the local copy.
+#[tauri::command]
+pub async fn read_local_appmanifest_state(
+    library_path: String,
+    app_id: String,
+) -> Result<Option<LocalManifestState>, String> {
+    // library_path is the steamapps/common folder; the manifest is in
+    // the parent steamapps/ folder.
+    let common = PathBuf::from(&library_path);
+    let steamapps = match common.parent() {
+        Some(p) => p.to_path_buf(),
+        None => return Ok(None),
+    };
+    let manifest = steamapps.join(format!("appmanifest_{}.acf", app_id));
+    if !manifest.exists() {
+        return Ok(None);
+    }
+    let content = std::fs::read_to_string(&manifest).map_err(|e| e.to_string())?;
+    let parsed = match super::catalog::parse_appmanifest(&content) {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+    let fully_installed = parsed
+        .state_flags
+        .as_deref()
+        .map(|s| s == "4")
+        .unwrap_or(false);
+    Ok(Some(LocalManifestState {
+        app_id: parsed.app_id,
+        build_id: parsed.build_id,
+        state_flags: parsed.state_flags,
+        fully_installed,
+    }))
 }

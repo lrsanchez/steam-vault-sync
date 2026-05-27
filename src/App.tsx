@@ -20,8 +20,10 @@ export default function App() {
   const [settingsReady, setSettingsReady] = useState(false);
 
   const games = useLibraryStore((s) => s.games);
+  const localOnlyGames = useLibraryStore((s) => s.localOnlyGames);
   const filter = useLibraryStore((s) => s.filter);
   const searchQuery = useLibraryStore((s) => s.searchQuery);
+  const selectedVaultId = useLibraryStore((s) => s.selectedVaultId);
   const activeCopy = useLibraryStore((s) => s.activeCopy);
 
   useEffect(() => {
@@ -67,13 +69,22 @@ export default function App() {
 
   const visibleGames = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
+    // "Local only" is a separate dataset (Steam-installed games not on
+    // any vault). Other filters operate on the vault games array.
+    if (filter === "local-only") {
+      return localOnlyGames.filter(
+        (g) => !q || g.title.toLowerCase().includes(q),
+      );
+    }
     return games.filter((g) => {
+      if (selectedVaultId && g.ssdId !== selectedVaultId) return false;
       if (filter === "available" && !g.isAvailable) return false;
       if (filter === "installed" && !g.isInstalled) return false;
+      if (filter === "outdated" && !g.hasUpdate) return false;
       if (q && !g.title.toLowerCase().includes(q)) return false;
       return true;
     });
-  }, [games, filter, searchQuery]);
+  }, [games, localOnlyGames, filter, searchQuery, selectedVaultId]);
 
   if (!settingsReady) {
     return (

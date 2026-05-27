@@ -13,6 +13,7 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
           folder_name TEXT NOT NULL UNIQUE,
           size_gb     REAL,
           cover_url   TEXT,
+          build_id    TEXT,
           added_at    DATETIME DEFAULT CURRENT_TIMESTAMP
         );
 
@@ -21,10 +22,14 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
           value TEXT
         );
         ",
-    )
+    )?;
+    // Migration for vaults created by v0.1.0 (no build_id column yet).
+    // ALTER TABLE ADD COLUMN errors if the column exists — swallow it.
+    let _ = conn.execute("ALTER TABLE games ADD COLUMN build_id TEXT", []);
+    Ok(())
 }
 
-fn open(drive_letter: &str) -> Result<Connection, String> {
+pub fn open(drive_letter: &str) -> Result<Connection, String> {
     let path = vaultsync_db_path(drive_letter);
     let conn = Connection::open(&path).map_err(|e| e.to_string())?;
     ensure_schema(&conn).map_err(|e| e.to_string())?;
@@ -47,7 +52,7 @@ pub async fn get_ssd_catalog(drive_letter: String) -> Result<Vec<Game>, String> 
     let letter = drive_letter.trim_end_matches(':').to_string();
 
     let mut stmt = conn
-        .prepare("SELECT id, app_id, title, folder_name, size_gb, cover_url FROM games ORDER BY title")
+        .prepare("SELECT id, app_id, title, folder_name, size_gb, cover_url, build_id FROM games ORDER BY title")
         .map_err(|e| e.to_string())?;
 
     let rows = stmt
@@ -59,11 +64,14 @@ pub async fn get_ssd_catalog(drive_letter: String) -> Result<Vec<Game>, String> 
                 folder_name: row.get(3)?,
                 size_gb: row.get::<_, Option<f64>>(4)?.unwrap_or(0.0),
                 cover_url: row.get(5)?,
+                build_id: row.get(6)?,
+                local_build_id: None,
                 ssd_id: id.clone(),
                 ssd_drive_letter: letter.clone(),
                 is_available: true,
                 is_installed: false,
                 installed_path: None,
+                has_update: false,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -137,16 +145,18 @@ pub async fn rescan_ssd(drive_letter: String) -> Result<Vec<Game>, String> {
                 m.app_id
             )
         });
+        let build_id = manifest.and_then(|m| m.build_id.clone());
 
         conn.execute(
-            "INSERT INTO games (app_id, title, folder_name, size_gb, cover_url)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO games (app_id, title, folder_name, size_gb, cover_url, build_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(folder_name) DO UPDATE SET
                size_gb = excluded.size_gb,
                app_id = COALESCE(excluded.app_id, games.app_id),
                title = CASE WHEN excluded.app_id IS NOT NULL THEN excluded.title ELSE games.title END,
-               cover_url = COALESCE(excluded.cover_url, games.cover_url)",
-            params![app_id, title, folder, size_gb, cover_url],
+               cover_url = COALESCE(excluded.cover_url, games.cover_url),
+               build_id = COALESCE(excluded.build_id, games.build_id)",
+            params![app_id, title, folder, size_gb, cover_url, build_id],
         )
         .map_err(|e| e.to_string())?;
     }
@@ -172,6 +182,10 @@ pub async fn rescan_ssd(drive_letter: String) -> Result<Vec<Game>, String> {
     get_ssd_catalog(drive_letter).await
 }
 
+pub fn folder_size_gb_pub(path: &Path) -> f64 {
+    folder_size_gb(path)
+}
+
 fn folder_size_gb(path: &Path) -> f64 {
     let mut total: u64 = 0;
     for entry in walkdir::WalkDir::new(path).into_iter().flatten() {
@@ -185,10 +199,12 @@ fn folder_size_gb(path: &Path) -> f64 {
 }
 
 #[derive(Debug)]
-struct AppManifest {
-    app_id: String,
-    name: String,
-    install_dir: String,
+pub struct AppManifest {
+    pub app_id: String,
+    pub name: String,
+    pub install_dir: String,
+    pub build_id: Option<String>,
+    pub state_flags: Option<String>,
 }
 
 /// Read every `appmanifest_*.acf` Steam wrote into the SSD's steamapps
@@ -220,10 +236,12 @@ fn read_appmanifests(drive_letter: &str) -> HashMap<String, AppManifest> {
     map
 }
 
-fn parse_appmanifest(content: &str) -> Option<AppManifest> {
+pub fn parse_appmanifest(content: &str) -> Option<AppManifest> {
     let mut app_id: Option<String> = None;
     let mut name: Option<String> = None;
     let mut install_dir: Option<String> = None;
+    let mut build_id: Option<String> = None;
+    let mut state_flags: Option<String> = None;
 
     for line in content.lines() {
         let trimmed = line.trim();
@@ -233,9 +251,10 @@ fn parse_appmanifest(content: &str) -> Option<AppManifest> {
             name = extract_acf_value(trimmed);
         } else if trimmed.starts_with("\"installdir\"") {
             install_dir = extract_acf_value(trimmed);
-        }
-        if app_id.is_some() && name.is_some() && install_dir.is_some() {
-            break;
+        } else if trimmed.starts_with("\"buildid\"") {
+            build_id = extract_acf_value(trimmed);
+        } else if trimmed.starts_with("\"StateFlags\"") {
+            state_flags = extract_acf_value(trimmed);
         }
     }
 
@@ -244,6 +263,8 @@ fn parse_appmanifest(content: &str) -> Option<AppManifest> {
         app_id: app_id?,
         name: name.unwrap_or_else(|| install_dir.clone()),
         install_dir,
+        build_id,
+        state_flags,
     })
 }
 

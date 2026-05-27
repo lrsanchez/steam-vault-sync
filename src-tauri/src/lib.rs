@@ -1,6 +1,6 @@
 mod commands;
 
-use commands::{catalog, copy, drives, metadata, steam};
+use commands::{catalog, copy, drives, metadata, steam, vdf_isolation};
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -33,10 +33,20 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             drives::scan_vault_ssd,
             drives::scan_local_steam_libraries,
+            drives::discover_vault_letters,
+            drives::scan_local_only_games,
             catalog::get_ssd_catalog,
             catalog::upsert_game,
             catalog::rescan_ssd,
             copy::copy_game,
+            copy::push_to_vault,
+            copy::copy_to_vault,
+            copy::delete_from_vault,
+            copy::hide_vault_manifest,
+            copy::restore_vault_manifest,
+            copy::discard_hidden_vault_manifest,
+            vdf_isolation::isolate_vault_for_steam_update,
+            vdf_isolation::restore_vault_from_isolation,
             copy::remove_local_game,
             copy::pause_copy,
             copy::resume_copy,
@@ -47,6 +57,8 @@ pub fn run() {
             steam::check_installed_games,
             metadata::fetch_steam_metadata,
             metadata::resolve_app_id,
+            metadata::check_vault_updates,
+            metadata::read_local_appmanifest_state,
             quit_app,
         ])
         .setup(|app| {

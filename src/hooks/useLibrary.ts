@@ -1,46 +1,65 @@
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useLibraryStore } from "@/store/library";
 import type { Game, LocalLibrary, SSD } from "@/types";
 
 const HOTPLUG_INTERVAL_MS = 3000;
-const DEFAULT_DRIVE_LETTER = "S";
 
 export function useLibrary() {
-  const setSsds = useLibraryStore((s) => s.setSsds);
   const upsertSsd = useLibraryStore((s) => s.upsertSsd);
   const setSsdConnected = useLibraryStore((s) => s.setSsdConnected);
-  const setGames = useLibraryStore((s) => s.setGames);
-  const mergeGames = useLibraryStore((s) => s.mergeGames);
+  const replaceGamesForSsd = useLibraryStore((s) => s.replaceGamesForSsd);
   const setLocalLibraries = useLibraryStore((s) => s.setLocalLibraries);
-  const ssds = useLibraryStore((s) => s.ssds);
+  const setLocalOnlyGames = useLibraryStore((s) => s.setLocalOnlyGames);
+  const markUpdates = useLibraryStore((s) => s.markUpdates);
 
-  const loadInitial = useCallback(async () => {
+  const refreshLocalOnly = useCallback(async (libs: LocalLibrary[]) => {
+    const vaultFolderNames = useLibraryStore
+      .getState()
+      .games.map((g) => g.folderName);
     try {
-      const ssd = await invoke<SSD>("scan_vault_ssd", {
-        driveLetter: DEFAULT_DRIVE_LETTER,
+      const localOnly = await invoke<Game[]>("scan_local_only_games", {
+        vaultFolderNames,
+        localLibraryPaths: libs.map((l) => l.path),
       });
-      upsertSsd(ssd);
-      const games = await invoke<Game[]>("get_ssd_catalog", {
-        driveLetter: DEFAULT_DRIVE_LETTER,
-      });
-      mergeGames(games);
-    } catch {
-      // SSD not connected — leave catalog empty
-      setSsds([]);
-      setGames([]);
+      setLocalOnlyGames(localOnly);
+    } catch (e) {
+      console.warn("scan_local_only_games failed:", e);
+      setLocalOnlyGames([]);
+    }
+  }, [setLocalOnlyGames]);
+
+  const checkUpdates = useCallback(async () => {
+    const state = useLibraryStore.getState();
+    const appIds = Array.from(
+      new Set(state.games.map((g) => g.appId).filter((x): x is string => !!x)),
+    );
+    if (appIds.length === 0) return;
+
+    // Include every Steam library Steam knows about (local + every
+    // connected vault). Steam writes pending-update state to whichever
+    // library's appmanifest is "active" for an AppID, so we need to
+    // check all of them.
+    const libraryPaths = new Set<string>();
+    for (const lib of state.localLibraries) libraryPaths.add(lib.path);
+    for (const ssd of state.ssds) {
+      if (ssd.connected) {
+        libraryPaths.add(
+          `${ssd.driveLetter}:\\SteamLibrary\\steamapps\\common`,
+        );
+      }
     }
 
     try {
-      const libs = await invoke<LocalLibrary[]>("scan_local_steam_libraries", {
-        vaultDriveLetter: DEFAULT_DRIVE_LETTER,
+      const outdated = await invoke<string[]>("check_vault_updates", {
+        libraryPaths: Array.from(libraryPaths),
+        appIds,
       });
-      setLocalLibraries(libs);
-      await refreshInstalled(libs);
-    } catch {
-      setLocalLibraries([]);
+      markUpdates(new Set(outdated));
+    } catch (e) {
+      console.error("check_vault_updates failed:", e);
     }
-  }, [upsertSsd, mergeGames, setSsds, setGames, setLocalLibraries]);
+  }, [markUpdates]);
 
   const refreshInstalled = useCallback(async (libs: LocalLibrary[]) => {
     const allGames = useLibraryStore.getState().games;
@@ -52,63 +71,158 @@ export function useLibrary() {
         vaultGames: folderNames,
         localLibraries: libraryPaths,
       });
-      const updated = allGames.map((g) => ({
-        ...g,
-        isInstalled: !!map[g.folderName],
-        installedPath: map[g.folderName] ?? null,
-      }));
+      const updated = await Promise.all(
+        allGames.map(async (g) => {
+          const installedPath = map[g.folderName] ?? null;
+          let localBuildId: string | null = null;
+          if (installedPath && g.appId) {
+            try {
+              const state = await invoke<{ buildId: string | null } | null>(
+                "read_local_appmanifest_state",
+                { libraryPath: installedPath, appId: g.appId },
+              );
+              localBuildId = state?.buildId ?? null;
+            } catch {
+              // ignore — missing manifest is OK
+            }
+          }
+          return {
+            ...g,
+            isInstalled: !!installedPath,
+            installedPath,
+            localBuildId,
+          };
+        }),
+      );
       useLibraryStore.getState().setGames(updated);
     } catch {
       // ignore
     }
   }, []);
 
-  const rescan = useCallback(async () => {
-    try {
-      const games = await invoke<Game[]>("rescan_ssd", {
-        driveLetter: DEFAULT_DRIVE_LETTER,
-      });
-      setGames(games);
-      const libs = useLibraryStore.getState().localLibraries;
-      await refreshInstalled(libs);
-    } catch (e) {
-      console.error("Rescan failed:", e);
-    }
-  }, [setGames, refreshInstalled]);
-
-  // Hotplug polling
-  const lastConnectedRef = useRef<boolean | null>(null);
-  useEffect(() => {
-    const interval = setInterval(async () => {
+  /// Load (or reload) a single vault by drive letter — scans the SSD,
+  /// merges its games into the store. Used both at initial load and
+  /// when a new vault is hot-plugged.
+  const loadVault = useCallback(
+    async (letter: string) => {
       try {
         const ssd = await invoke<SSD>("scan_vault_ssd", {
-          driveLetter: DEFAULT_DRIVE_LETTER,
+          driveLetter: letter,
         });
-        if (lastConnectedRef.current === false) {
-          upsertSsd(ssd);
-          const games = await invoke<Game[]>("get_ssd_catalog", {
-            driveLetter: DEFAULT_DRIVE_LETTER,
-          });
-          mergeGames(games);
-          const libs = useLibraryStore.getState().localLibraries;
-          await refreshInstalled(libs);
-        } else {
-          setSsdConnected(ssd.id, true);
-        }
-        lastConnectedRef.current = true;
+        upsertSsd(ssd);
+        const games = await invoke<Game[]>("get_ssd_catalog", {
+          driveLetter: letter,
+        });
+        replaceGamesForSsd(ssd.id, games);
+        return ssd;
+      } catch (e) {
+        console.warn(`Failed to load vault ${letter}:`, e);
+        return null;
+      }
+    },
+    [upsertSsd, replaceGamesForSsd],
+  );
+
+  const loadInitial = useCallback(async () => {
+    const letters = await invoke<string[]>("discover_vault_letters").catch(
+      () => [] as string[],
+    );
+
+    for (const letter of letters) {
+      await loadVault(letter);
+    }
+
+    try {
+      const libs = await invoke<LocalLibrary[]>("scan_local_steam_libraries", {
+        vaultDriveLetters: letters,
+      });
+      setLocalLibraries(libs);
+      await refreshInstalled(libs);
+      await refreshLocalOnly(libs);
+    } catch {
+      setLocalLibraries([]);
+    }
+
+    checkUpdates();
+  }, [loadVault, refreshInstalled, refreshLocalOnly, setLocalLibraries, checkUpdates]);
+
+  /// User-triggered rescan: walks every CONNECTED vault's SteamLibrary
+  /// folder, refreshes catalog + buildids, then re-checks updates.
+  const rescan = useCallback(async () => {
+    const ssds = useLibraryStore.getState().ssds.filter((s) => s.connected);
+    for (const ssd of ssds) {
+      try {
+        const games = await invoke<Game[]>("rescan_ssd", {
+          driveLetter: ssd.driveLetter,
+        });
+        replaceGamesForSsd(ssd.id, games);
+      } catch (e) {
+        console.error(`Rescan failed for ${ssd.driveLetter}:`, e);
+      }
+    }
+    const libs = useLibraryStore.getState().localLibraries;
+    await refreshInstalled(libs);
+    await refreshLocalOnly(libs);
+    checkUpdates();
+  }, [replaceGamesForSsd, refreshInstalled, refreshLocalOnly, checkUpdates]);
+
+  // Hot-plug: poll discovery every 3s, react to new/removed vaults.
+  useEffect(() => {
+    const interval = setInterval(async () => {
+      let detected: string[];
+      try {
+        detected = await invoke<string[]>("discover_vault_letters");
       } catch {
-        if (lastConnectedRef.current !== false) {
-          ssds.forEach((s) => setSsdConnected(s.id, false));
+        return;
+      }
+      const detectedSet = new Set(detected.map((s) => s.toUpperCase()));
+      const known = useLibraryStore.getState().ssds;
+      const knownLetters = new Set(known.map((s) => s.driveLetter.toUpperCase()));
+
+      // Newly-connected vaults
+      let topologyChanged = false;
+      for (const letter of detected) {
+        if (!knownLetters.has(letter.toUpperCase())) {
+          await loadVault(letter);
+          topologyChanged = true;
         }
-        lastConnectedRef.current = false;
+      }
+
+      // Disappeared vaults — mark disconnected but keep their catalog
+      // entries (so user still sees them, just greyed out).
+      for (const ssd of known) {
+        const stillThere = detectedSet.has(ssd.driveLetter.toUpperCase());
+        if (!stillThere && ssd.connected) {
+          setSsdConnected(ssd.id, false);
+          topologyChanged = true;
+        } else if (stillThere && !ssd.connected) {
+          setSsdConnected(ssd.id, true);
+          topologyChanged = true;
+        }
+      }
+
+      // If a vault appeared or vanished, refresh local-library exclusion
+      // and the update badges.
+      if (topologyChanged) {
+        try {
+          const libs = await invoke<LocalLibrary[]>(
+            "scan_local_steam_libraries",
+            { vaultDriveLetters: detected },
+          );
+          setLocalLibraries(libs);
+          await refreshInstalled(libs);
+          checkUpdates();
+        } catch {
+          // ignore
+        }
       }
     }, HOTPLUG_INTERVAL_MS);
     return () => clearInterval(interval);
-  }, [ssds, upsertSsd, mergeGames, setSsdConnected, refreshInstalled]);
+  }, [loadVault, setSsdConnected, setLocalLibraries, refreshInstalled, checkUpdates]);
 
   useEffect(() => {
     loadInitial();
   }, [loadInitial]);
 
-  return { rescan, loadInitial };
+  return { rescan, loadInitial, checkUpdates, loadVault };
 }

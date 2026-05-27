@@ -13,12 +13,24 @@ export interface Game {
   folderName: string;
   sizeGb: number;
   coverUrl: string | null;
+  buildId: string | null;
+  localBuildId: string | null;
   ssdId: string;
   ssdDriveLetter: string;
   isAvailable: boolean;
   isInstalled: boolean;
   installedPath: string | null;
+  hasUpdate: boolean;
 }
+
+export type LibraryFilter =
+  | "all"
+  | "available"
+  | "installed"
+  | "outdated"
+  | "local-only";
+
+export const LOCAL_ONLY_SSD_ID = "__local__";
 
 export interface LocalLibrary {
   path: string;
@@ -40,8 +52,6 @@ export interface CopyJob {
   status: CopyStatus;
   error?: string;
 }
-
-export type LibraryFilter = "all" | "available" | "installed";
 
 export interface GameRecord {
   appId: string | null;

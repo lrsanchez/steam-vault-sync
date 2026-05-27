@@ -23,32 +23,76 @@ Steam Vault Sync is the desktop app that makes this workflow nice.
 
 ## Features
 
-- **Browse your vault** — cover art, titles, sizes for every game on
-  the vault SSD, even when the SSD isn't plugged in. The catalog is
-  cached on the SSD itself in a SQLite database (`vaultsync.db`).
-- **One-click copy** — pick a destination Steam library on your PC and
-  Steam Vault Sync copies the game folder. Progress, speed, and ETA
-  shown in real time.
-- **Pause / Resume / Cancel** — for the long copies. Pause stops disk
-  I/O cleanly at chunk boundaries; cancel deletes the partial copy.
-- **Auto-register with Steam** — when a copy completes, the app fires
-  `steam://install/<appid>` so Steam picks up the new install
-  automatically.
-- **Launch directly** — installed games show a Launch Game button
-  that opens them via `steam://rungameid/<appid>`.
-- **Clean uninstall** — removing a local copy deletes the game folder,
-  the `appmanifest_*.acf`, downloading cache, and workshop content —
-  so Steam correctly sees the game as not installed.
-- **System tray** — close to tray; tray tooltip shows live copy
-  progress; right-click for Show / Exit.
-- **Multi-library awareness** — sees every Steam library registered
-  in `libraryfolders.vdf` and shows a per-drive breakdown of which
-  vault games are installed where.
-- **Cover art with zero config** — reads Steam's `appmanifest_*.acf`
-  files directly off the SSD to map folder → AppID, then pulls covers
-  from Steam's CDN. No API key required.
-- **Hot-plug detection** — connect or disconnect the vault SSD and
-  the UI updates within 3 seconds.
+### Vault library management
+- **Browse your vault(s)** — cover art, titles, sizes, and Steam
+  buildids for every game across every connected vault SSD, even when
+  a vault is disconnected. The catalog persists on each SSD in its own
+  SQLite database (`vaultsync.db`).
+- **Multi-vault support** — connect any number of vault SSDs at once.
+  Auto-discovery probes A:–Z: for `vaultsync.db` on every hot-plug
+  tick. Click any vault in the sidebar to filter the grid to just
+  that vault's games.
+- **Copy between vaults** — via the ⋯ menu on any card; useful for
+  mirroring a backup vault or splitting your collection across drives.
+- **Delete from vault** — irreversibly removes the game folder,
+  `appmanifest_*.acf`, the catalog row, AND the vault's entry in
+  Steam's `libraryfolders.vdf` so Steam stops tracking it.
+- **Local-only view** — a separate sidebar entry surfaces games
+  installed on your PC's local Steam libraries that aren't in any
+  vault yet. One click backs them up.
+
+### The staged-update workflow (the killer feature)
+Steam patching games installed on a USB SSD is unbearably slow —
+hundreds of MB taking *hours* of random I/O. Steam Vault Sync routes
+patches through your fast internal NVMe instead:
+
+1. Outdated games get an orange **Update** badge (detected via the
+   appmanifest `StateFlags` — same signal Steam's own UI uses).
+2. Click **↻ Update Vault**. The app: copies the vault game to local
+   (sequential USB read, fast), temporarily edits
+   `libraryfolders.vdf` so Steam only sees the local install,
+   gracefully closes Steam, then triggers `steam://install/<appid>`.
+3. Steam patches the local copy on your NVMe (fast random I/O).
+4. When Steam finishes, the app pushes the updated local copy back to
+   the vault (sequential USB write), restores `libraryfolders.vdf`,
+   and asks whether to keep the local copy.
+
+Total time on a real test: **15 minutes** for a 300 MB patch on a
+90 GB game, vs **>1 hour** for Steam patching the vault directly.
+
+### Copy operations
+- **One-click copy vault → local** with library picker if you have
+  multiple Steam libraries on your PC.
+- **Pause / Resume / Cancel** — all copies (vault→local, local→vault,
+  vault→vault) honor the same control state at 4 MB chunk boundaries.
+- **Atomic vault writes** — pushes write to `<game>.partial` then
+  rename-swap, so an interrupted update never leaves your vault in a
+  broken state.
+- **Real-time progress** — speed, ETA, % shown both in the app and in
+  the system tray tooltip while minimized.
+
+### Steam integration
+- **Auto-register** copied games with Steam via `steam://install/<appid>`.
+- **Launch directly** from installed games via `steam://rungameid/<appid>`.
+- **Clean uninstall** removes the game folder, manifest, downloading
+  cache, and workshop content so Steam correctly sees the game as
+  not installed.
+- **Multi-library awareness** — reads every Steam library in
+  `libraryfolders.vdf`, shows a per-drive breakdown under "Installed
+  on this PC", and excludes vault drives from the local list.
+- **Cover art with zero config** — reads `appmanifest_*.acf` to map
+  folder → AppID, then pulls covers from Steam's CDN. No API key.
+- **Buildid display** — each card shows the vault's installed build
+  number and the local copy's build number (highlighted amber when
+  they differ).
+
+### Quality of life
+- **System tray** — close-to-tray, hover-for-progress tooltip during
+  long copies, explicit Show / Exit menu.
+- **Hot-plug** — connect or disconnect any vault and the UI updates
+  within 3 seconds.
+- **Smart filters** — All, Available, Installed on PC, Updates
+  available (count badge), Local only, and per-vault filtering.
 
 ## Quick start (use the prebuilt binary)
 
@@ -158,9 +202,9 @@ Things I might add (PRs welcome under the
 
 - Support for non-Steam games (manual cover art entry)
 - SteamGridDB integration for games whose `appmanifest_*.acf` is missing
-- Multi-vault support (more than one SSD plugged in at the same time)
-- Linux / macOS support (currently Windows-only)
 - Bandwidth throttling for copies
+- Linux / macOS support (currently Windows-only)
+- Automatic updater for the app itself
 
 ## Contributing
 

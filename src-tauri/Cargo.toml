@@ -1,6 +1,6 @@
 [package]
 name = "vaultsync"
-version = "0.1.0"
+version = "0.3.0"
 description = "Steam Vault Sync — manage your Steam game vault across external SSDs"
 authors = ["Leandro Sanchez <leandrorsanchez@gmail.com>"]
 license = "PolyForm-Noncommercial-1.0.0"

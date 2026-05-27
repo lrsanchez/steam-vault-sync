@@ -3,6 +3,7 @@ pub mod copy;
 pub mod drives;
 pub mod metadata;
 pub mod steam;
+pub mod vdf_isolation;
 
 use serde::{Deserialize, Serialize};
 
@@ -15,11 +16,14 @@ pub struct Game {
     pub folder_name: String,
     pub size_gb: f64,
     pub cover_url: Option<String>,
+    pub build_id: Option<String>,
+    pub local_build_id: Option<String>,
     pub ssd_id: String,
     pub ssd_drive_letter: String,
     pub is_available: bool,
     pub is_installed: bool,
     pub installed_path: Option<String>,
+    pub has_update: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

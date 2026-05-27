@@ -84,7 +84,7 @@ export function Settings({ settings, onChange }: SettingsProps) {
 
         <div className="mt-10 pt-5 border-t border-neutral-800 text-xs text-neutral-500 space-y-1">
           <div className="font-medium text-neutral-300">Steam Vault Sync</div>
-          <div>Version 0.1.0</div>
+          <div>Version 0.3.0</div>
           <div>Created by Leandro Sanchez and Claude</div>
         </div>
       </div>

@@ -82,6 +82,7 @@ pub async fn copy_game(
     source_path: String,
     dest_library_path: String,
     game_title: String,
+    app_id: Option<String>,
 ) -> Result<(), String> {
     let source = PathBuf::from(&source_path);
     if !source.exists() {
@@ -127,6 +128,7 @@ pub async fn copy_game(
                 &dest,
                 &app_handle,
                 &title,
+                "Copying",
                 &copied,
                 total_bytes,
                 &start,
@@ -155,6 +157,26 @@ pub async fn copy_game(
         return Err(e);
     }
 
+    // Copy the source's appmanifest_<appid>.acf into the destination
+    // Steam library's steamapps folder. Without this, Steam treats the
+    // copied files as "loose files of unknown version" and performs a
+    // full integrity check (reading every file's bytes to hash) before
+    // it can apply a patch — wasting tens of minutes on big games. With
+    // the manifest in place, Steam knows the buildid and downloads
+    // only the delta to the cloud version.
+    if let Some(id) = app_id.as_deref() {
+        let source_steamapps = source.parent().and_then(|p| p.parent());
+        let dest_steamapps = dest_root.parent();
+        if let (Some(ss), Some(ds)) = (source_steamapps, dest_steamapps) {
+            let acf_name = format!("appmanifest_{}.acf", id);
+            let src_acf = ss.join(&acf_name);
+            let dst_acf = ds.join(&acf_name);
+            if src_acf.exists() {
+                let _ = fs::copy(&src_acf, &dst_acf);
+            }
+        }
+    }
+
     set_tray_tooltip(&app_handle, DEFAULT_TOOLTIP);
     let _ = app_handle.emit(
         "copy://done",
@@ -169,6 +191,7 @@ fn copy_dir_recursive(
     dest: &Path,
     app_handle: &AppHandle,
     game_title: &str,
+    verb: &str,
     copied: &AtomicU64,
     total_bytes: u64,
     start: &Instant,
@@ -189,6 +212,7 @@ fn copy_dir_recursive(
                 &to,
                 app_handle,
                 game_title,
+                verb,
                 copied,
                 total_bytes,
                 start,
@@ -201,6 +225,7 @@ fn copy_dir_recursive(
                 &to,
                 app_handle,
                 game_title,
+                verb,
                 copied,
                 total_bytes,
                 start,
@@ -217,6 +242,7 @@ fn copy_file_chunked(
     dest: &Path,
     app_handle: &AppHandle,
     game_title: &str,
+    verb: &str,
     copied: &AtomicU64,
     total_bytes: u64,
     start: &Instant,
@@ -269,8 +295,8 @@ fn copy_file_chunked(
             set_tray_tooltip(
                 app_handle,
                 &format!(
-                    "Copying {} — {:.0}%  ({:.0} MB/s, ETA {}s)",
-                    game_title, pct, mbps, eta
+                    "{} {} — {:.0}%  ({:.0} MB/s, ETA {}s)",
+                    verb, game_title, pct, mbps, eta
                 ),
             );
             let _ = app_handle.emit(
@@ -297,6 +323,431 @@ fn total_size(path: &Path) -> u64 {
         }
     }
     total
+}
+
+/// Push a locally-installed, Steam-updated game back to the vault.
+/// Used in the "staged update" workflow: user copies vault game → local
+/// (fast sequential read), lets Steam patch the local copy on internal
+/// NVMe (fast random I/O), then pushes the updated copy back to the
+/// vault. Drastically faster than Steam patching the vault in-place
+/// over USB.
+///
+/// Write strategy: copy into `<folder>.partial` in vault common, then
+/// remove the old folder and rename `.partial` → final. If the copy is
+/// cancelled or fails partway, the original vault folder is untouched
+/// and the `.partial` is cleaned up.
+#[tauri::command]
+pub async fn push_to_vault(
+    app_handle: AppHandle,
+    state: State<'_, CopyControlState>,
+    local_lib_path: String,
+    vault_lib_path: String,
+    folder_name: String,
+    app_id: Option<String>,
+    game_title: String,
+) -> Result<(), String> {
+    let source = PathBuf::from(&local_lib_path).join(&folder_name);
+    if !source.exists() {
+        return Err(format!(
+            "Local game folder not found: {}",
+            source.display()
+        ));
+    }
+
+    let vault_common = PathBuf::from(&vault_lib_path);
+    let dest_final = vault_common.join(&folder_name);
+    let dest_partial = vault_common.join(format!("{}.partial", folder_name));
+
+    // Clean up any leftover .partial from a previous failed attempt.
+    if dest_partial.exists() {
+        fs::remove_dir_all(&dest_partial).map_err(|e| e.to_string())?;
+    }
+
+    fs::create_dir_all(&vault_common).map_err(|e| e.to_string())?;
+
+    let total_bytes = total_size(&source);
+    let copied = Arc::new(AtomicU64::new(0));
+    let start = Instant::now();
+    let last_emit = Arc::new(Mutex::new(Instant::now()));
+
+    let control = Arc::new(CopyControl {
+        paused: AtomicBool::new(false),
+        cancelled: AtomicBool::new(false),
+        title: game_title.clone(),
+    });
+    *state.0.lock().unwrap() = Some(control.clone());
+
+    set_tray_tooltip(
+        &app_handle,
+        &format!("Updating vault: {} — starting…", game_title),
+    );
+
+    let copy_result = tokio::task::spawn_blocking({
+        let app_handle = app_handle.clone();
+        let source = source.clone();
+        let dest = dest_partial.clone();
+        let title = game_title.clone();
+        let copied = copied.clone();
+        let last_emit = last_emit.clone();
+        let control = control.clone();
+        move || -> Result<(), String> {
+            copy_dir_recursive(
+                &source,
+                &dest,
+                &app_handle,
+                &title,
+                "Updating vault:",
+                &copied,
+                total_bytes,
+                &start,
+                &last_emit,
+                &control,
+            )
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    *state.0.lock().unwrap() = None;
+
+    if let Err(e) = copy_result {
+        let _ = fs::remove_dir_all(&dest_partial);
+        set_tray_tooltip(&app_handle, DEFAULT_TOOLTIP);
+        let event = if control.cancelled.load(Ordering::Relaxed) {
+            "copy://cancelled"
+        } else {
+            "copy://error"
+        };
+        let _ = app_handle.emit(
+            event,
+            serde_json::json!({ "title": game_title, "error": e }),
+        );
+        return Err(e);
+    }
+
+    // Atomic swap: remove old vault folder, then rename partial → final.
+    // Brief vulnerability window (a few ms on SSD) where neither folder
+    // exists at the canonical name. If the app crashes here, the
+    // `.partial` survives and the user can recover by renaming it.
+    if dest_final.exists() {
+        if let Err(e) = fs::remove_dir_all(&dest_final) {
+            set_tray_tooltip(&app_handle, DEFAULT_TOOLTIP);
+            return Err(format!(
+                "Vault copy updated successfully but old folder couldn't be removed: {}. The new copy is at {}",
+                e,
+                dest_partial.display()
+            ));
+        }
+    }
+    if let Err(e) = fs::rename(&dest_partial, &dest_final) {
+        set_tray_tooltip(&app_handle, DEFAULT_TOOLTIP);
+        return Err(format!("Failed to rename partial to final: {}", e));
+    }
+
+    // Copy the updated appmanifest_<appid>.acf so the vault's buildid
+    // matches the new install. Without this, the next scan would still
+    // see the old buildid.
+    if let Some(id) = app_id.as_deref() {
+        let local_steamapps = PathBuf::from(&local_lib_path).parent().map(|p| p.to_path_buf());
+        let vault_steamapps = vault_common.parent().map(|p| p.to_path_buf());
+        if let (Some(ls), Some(vs)) = (local_steamapps, vault_steamapps) {
+            let acf_name = format!("appmanifest_{}.acf", id);
+            let src_acf = ls.join(&acf_name);
+            let dst_acf = vs.join(&acf_name);
+            if src_acf.exists() {
+                let _ = fs::copy(&src_acf, &dst_acf);
+            }
+        }
+    }
+
+    set_tray_tooltip(&app_handle, DEFAULT_TOOLTIP);
+    let _ = app_handle.emit(
+        "vault-push://done",
+        serde_json::json!({ "title": game_title, "destPath": dest_final.to_string_lossy() }),
+    );
+
+    Ok(())
+}
+
+/// Copy a game folder from one vault to another. Same chunked
+/// pipeline as `push_to_vault` (atomic .partial-then-rename, pause/
+/// resume/cancel, tray tooltip). Also copies the source's
+/// appmanifest_*.acf into the destination's steamapps folder so the
+/// destination vault is immediately recognized by Steam (and by our
+/// own next rescan).
+///
+/// Note: USB-to-USB copy speed is bounded by the slower of the two
+/// drives — and worse if they share a USB controller.
+#[tauri::command]
+pub async fn copy_to_vault(
+    app_handle: AppHandle,
+    state: State<'_, CopyControlState>,
+    source_lib_path: String,
+    dest_lib_path: String,
+    folder_name: String,
+    app_id: Option<String>,
+    game_title: String,
+) -> Result<(), String> {
+    let source = PathBuf::from(&source_lib_path).join(&folder_name);
+    if !source.exists() {
+        return Err(format!(
+            "Source game folder not found: {}",
+            source.display()
+        ));
+    }
+
+    let dest_common = PathBuf::from(&dest_lib_path);
+    let dest_final = dest_common.join(&folder_name);
+    let dest_partial = dest_common.join(format!("{}.partial", folder_name));
+
+    if dest_partial.exists() {
+        fs::remove_dir_all(&dest_partial).map_err(|e| e.to_string())?;
+    }
+
+    fs::create_dir_all(&dest_common).map_err(|e| e.to_string())?;
+
+    let total_bytes = total_size(&source);
+    let copied = Arc::new(AtomicU64::new(0));
+    let start = Instant::now();
+    let last_emit = Arc::new(Mutex::new(Instant::now()));
+
+    let control = Arc::new(CopyControl {
+        paused: AtomicBool::new(false),
+        cancelled: AtomicBool::new(false),
+        title: game_title.clone(),
+    });
+    *state.0.lock().unwrap() = Some(control.clone());
+
+    set_tray_tooltip(
+        &app_handle,
+        &format!("Copying to vault: {} — starting…", game_title),
+    );
+
+    let copy_result = tokio::task::spawn_blocking({
+        let app_handle = app_handle.clone();
+        let source = source.clone();
+        let dest = dest_partial.clone();
+        let title = game_title.clone();
+        let copied = copied.clone();
+        let last_emit = last_emit.clone();
+        let control = control.clone();
+        move || -> Result<(), String> {
+            copy_dir_recursive(
+                &source,
+                &dest,
+                &app_handle,
+                &title,
+                "Copying to vault:",
+                &copied,
+                total_bytes,
+                &start,
+                &last_emit,
+                &control,
+            )
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    *state.0.lock().unwrap() = None;
+
+    if let Err(e) = copy_result {
+        let _ = fs::remove_dir_all(&dest_partial);
+        set_tray_tooltip(&app_handle, DEFAULT_TOOLTIP);
+        let event = if control.cancelled.load(Ordering::Relaxed) {
+            "copy://cancelled"
+        } else {
+            "copy://error"
+        };
+        let _ = app_handle.emit(
+            event,
+            serde_json::json!({ "title": game_title, "error": e }),
+        );
+        return Err(e);
+    }
+
+    if dest_final.exists() {
+        if let Err(e) = fs::remove_dir_all(&dest_final) {
+            set_tray_tooltip(&app_handle, DEFAULT_TOOLTIP);
+            return Err(format!(
+                "Copy completed but old destination folder couldn't be removed: {}. New copy is at {}",
+                e,
+                dest_partial.display()
+            ));
+        }
+    }
+    if let Err(e) = fs::rename(&dest_partial, &dest_final) {
+        set_tray_tooltip(&app_handle, DEFAULT_TOOLTIP);
+        return Err(format!("Failed to rename partial to final: {}", e));
+    }
+
+    // Copy the source vault's appmanifest into the destination
+    // steamapps folder so Steam (and our rescan) recognizes the new
+    // install immediately.
+    if let Some(id) = app_id.as_deref() {
+        let source_steamapps = PathBuf::from(&source_lib_path).parent().map(|p| p.to_path_buf());
+        let dest_steamapps = dest_common.parent().map(|p| p.to_path_buf());
+        if let (Some(ss), Some(ds)) = (source_steamapps, dest_steamapps) {
+            let acf_name = format!("appmanifest_{}.acf", id);
+            let src_acf = ss.join(&acf_name);
+            let dst_acf = ds.join(&acf_name);
+            if src_acf.exists() {
+                let _ = fs::copy(&src_acf, &dst_acf);
+            }
+        }
+    }
+
+    set_tray_tooltip(&app_handle, DEFAULT_TOOLTIP);
+    let _ = app_handle.emit(
+        "vault-push://done",
+        serde_json::json!({ "title": game_title, "destPath": dest_final.to_string_lossy() }),
+    );
+
+    Ok(())
+}
+
+/// Permanently delete a game from a vault. Removes:
+///   - the game folder under `steamapps/common/`
+///   - the matching `appmanifest_<appid>.acf`
+///   - the row from `vaultsync.db`
+///   - the AppID entry from `libraryfolders.vdf`'s vault apps block
+///
+/// Does NOT touch any local install on the user's PC. Caller MUST
+/// confirm with the user first — this is irreversible from VaultSync's
+/// side (the game can be reinstalled via Steam later if the user wants
+/// it back in the vault).
+#[tauri::command]
+pub async fn delete_from_vault(
+    drive_letter: String,
+    folder_name: String,
+    app_id: Option<String>,
+) -> Result<(), String> {
+    let common = super::steam_common_path(&drive_letter);
+    let target = common.join(&folder_name);
+
+    if target.exists() {
+        fs::remove_dir_all(&target)
+            .map_err(|e| format!("Failed to remove vault game folder: {}", e))?;
+    }
+
+    if let Some(id) = app_id.as_deref() {
+        if let Some(steamapps) = common.parent() {
+            let manifest = steamapps.join(format!("appmanifest_{}.acf", id));
+            if manifest.exists() {
+                let _ = fs::remove_file(&manifest);
+            }
+        }
+    }
+
+    // Remove the row from the vault's vaultsync.db so the catalog
+    // matches reality on next launch.
+    let conn = super::catalog::open(&drive_letter)?;
+    conn.execute(
+        "DELETE FROM games WHERE folder_name = ?1",
+        rusqlite::params![folder_name],
+    )
+    .map_err(|e| e.to_string())?;
+
+    // Tell Steam this AppID is no longer in the vault library.
+    if let Some(id) = app_id.as_deref() {
+        let _ = super::vdf_isolation::permanently_strip_app_from_libraryfolders(
+            &drive_letter,
+            id,
+        );
+    }
+
+    Ok(())
+}
+
+/// Temporarily rename the vault's `appmanifest_<appid>.acf` so Steam
+/// can no longer see the vault install while we patch the local copy.
+/// Without this, Steam picks whichever install it found first (often
+/// the vault) when handling `steam://install/<appid>`, defeating the
+/// whole "stage to fast NVMe" workflow.
+///
+/// The renamed sentinel lives next to the original as
+/// `appmanifest_<appid>.acf.vaultsync-hidden`. Caller is responsible
+/// for either restoring it (`restore_vault_manifest`) on cancel/error
+/// or discarding it (`discard_hidden_vault_manifest`) after the
+/// push-back has written a fresh manifest to the same location.
+#[tauri::command]
+pub async fn hide_vault_manifest(
+    vault_lib_path: String,
+    app_id: String,
+) -> Result<bool, String> {
+    let common = PathBuf::from(&vault_lib_path);
+    let steamapps = common
+        .parent()
+        .ok_or_else(|| format!("Cannot derive steamapps from {}", common.display()))?;
+    let manifest = steamapps.join(format!("appmanifest_{}.acf", app_id));
+    let hidden = steamapps.join(format!("appmanifest_{}.acf.vaultsync-hidden", app_id));
+
+    // If a stale hidden file from a previous run exists, remove it so
+    // the rename below doesn't fail.
+    if hidden.exists() {
+        let _ = fs::remove_file(&hidden);
+    }
+
+    if !manifest.exists() {
+        // Vault doesn't have a manifest for this AppID — nothing to hide.
+        return Ok(false);
+    }
+
+    fs::rename(&manifest, &hidden).map_err(|e| {
+        format!(
+            "Failed to hide vault manifest at {}: {}",
+            manifest.display(),
+            e
+        )
+    })?;
+    Ok(true)
+}
+
+/// Restore the previously-hidden vault manifest. Used when the auto-
+/// update workflow is cancelled or fails before push-back has written
+/// a fresh manifest.
+#[tauri::command]
+pub async fn restore_vault_manifest(
+    vault_lib_path: String,
+    app_id: String,
+) -> Result<(), String> {
+    let common = PathBuf::from(&vault_lib_path);
+    let steamapps = common
+        .parent()
+        .ok_or_else(|| format!("Cannot derive steamapps from {}", common.display()))?;
+    let manifest = steamapps.join(format!("appmanifest_{}.acf", app_id));
+    let hidden = steamapps.join(format!("appmanifest_{}.acf.vaultsync-hidden", app_id));
+
+    if !hidden.exists() {
+        return Ok(());
+    }
+    // If the real manifest got recreated for some reason (e.g.,
+    // partial push-back wrote one), prefer the existing real one and
+    // discard the backup.
+    if manifest.exists() {
+        let _ = fs::remove_file(&hidden);
+        return Ok(());
+    }
+    fs::rename(&hidden, &manifest)
+        .map_err(|e| format!("Failed to restore vault manifest: {}", e))
+}
+
+/// Delete the hidden backup after a successful push-back has written
+/// a fresh manifest to the original location.
+#[tauri::command]
+pub async fn discard_hidden_vault_manifest(
+    vault_lib_path: String,
+    app_id: String,
+) -> Result<(), String> {
+    let common = PathBuf::from(&vault_lib_path);
+    let steamapps = common
+        .parent()
+        .ok_or_else(|| format!("Cannot derive steamapps from {}", common.display()))?;
+    let hidden = steamapps.join(format!("appmanifest_{}.acf.vaultsync-hidden", app_id));
+    if hidden.exists() {
+        let _ = fs::remove_file(&hidden);
+    }
+    Ok(())
 }
 
 #[tauri::command]
