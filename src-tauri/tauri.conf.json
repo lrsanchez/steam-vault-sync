@@ -13,10 +13,13 @@
     "windows": [
       {
         "title": "Steam Vault Sync",
-        "width": 1280,
-        "height": 800,
+        "width": 1200,
+        "height": 720,
         "minWidth": 960,
         "minHeight": 600,
+        "center": true,
+        "maximized": false,
+        "fullscreen": false,
         "decorations": true,
         "transparent": false,
         "resizable": true
